@@ -9,8 +9,12 @@
 #include "common/cast.h"
 #include "common/exception/io.h"
 #include "common/exception/not_implemented.h"
+#include "common/string_utils.h"
+#include "extension/extension.h"
+#include "httpfs_extension.h"
 #include "transaction/transaction.h"
 #include <format>
+#include <cstdio>
 
 #ifdef __WASM__
 #include <emscripten.h>
@@ -20,6 +24,14 @@ namespace lbug {
 namespace httpfs_extension {
 
 using namespace lbug::common;
+
+std::unordered_map<std::string, std::unique_ptr<httplib::Client>>
+    HTTPFileSystem::sharedNoRedirectClients;
+std::mutex HTTPFileSystem::httpPoolMtx;
+std::mutex HTTPFileSystem::hostLocksMtx;
+std::unordered_map<std::string, std::shared_ptr<std::mutex>> HTTPFileSystem::hostLocks;
+std::unordered_map<std::string, uint64_t> HTTPFileSystem::httpSizeCache;
+std::mutex HTTPFileSystem::httpSizeCacheMtx;
 
 HTTPResponse::HTTPResponse(httplib::Response& res, std::string url)
     : code{res.status}, error{res.reason}, url{std::move(url)}, body{res.body} {
@@ -199,8 +211,26 @@ HTTPFileInfo::HTTPFileInfo(std::string path, FileSystem* fileSystem, int flags,
       httpConfig{context}, cachedFileInfo{nullptr} {}
 
 void HTTPFileInfo::initMetadata() {
-    auto hfs = fileSystem->ptrCast<HTTPFileSystem>();
+    // The HTTP client must be initialized on every open, including the fast
+    // path below: a size-cache hit skips the HEAD request, but any subsequent
+    // read still dereferences httpClient. Leaving it null here caused a
+    // SIGSEGV on the first ranged GET of every repeat open of the same URL
+    // (https://github.com/LadybugDB/ladybug/issues/880).
     initializeClient();
+    // Remote files are immutable during a query; reuse the file size learned by
+    // an earlier openFile() for the same URL instead of paying a fresh HEAD +
+    // redirect round trip per open. This is what turns N opens of the same
+    // parquet file (~450 in a rel scan) into a single HEAD.
+    {
+        std::lock_guard<std::mutex> lck{HTTPFileSystem::httpSizeCacheMtx};
+        auto it = HTTPFileSystem::httpSizeCache.find(path);
+        if (it != HTTPFileSystem::httpSizeCache.end()) {
+            length = it->second;
+            return;
+        }
+    }
+
+    auto hfs = fileSystem->ptrCast<HTTPFileSystem>();
     auto res = hfs->headRequest(this->ptrCast<HTTPFileInfo>(), path, {});
     std::string rangeLength;
     if (res->code != 200) {
@@ -278,9 +308,21 @@ void HTTPFileInfo::initMetadata() {
             // LCOV_EXCL_STOP
         }
     }
+    if (length > 0) {
+        std::lock_guard<std::mutex> lck{HTTPFileSystem::httpSizeCacheMtx};
+        HTTPFileSystem::httpSizeCache[path] = length;
+    }
 }
 
 void HTTPFileInfo::initialize(main::ClientContext* context) {
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+    // Content-addressed (xet://) files may persist fetched spans across runs;
+    // everything else must opt in through the http_cache_blocks option/env var.
+    if (httpConfig.prefetchDepth > 0 || httpConfig.cacheBlocks || immutableContent) {
+        auto* selfFs = fileSystem->ptrCast<HTTPFileSystem>();
+        selfFs->ensureBlockCache(context, httpConfig.cacheBlocks || immutableContent);
+    }
+#endif
     if (httpConfig.cacheFile && !VirtualFileSystem::GetUnsafe(*context)->isCompressedFile(path)) {
         auto hfs = fileSystem->ptrCast<HTTPFileSystem>();
         cachedFileInfo = hfs->getCachedFileManager().getCachedFileInfo(this,
@@ -299,10 +341,22 @@ void HTTPFileInfo::initializeClient() {
 
 std::unique_ptr<common::FileInfo> HTTPFileSystem::openFile(const std::string& path,
     FileOpenFlags flags, main::ClientContext* context) {
+    return openFileWithImmutability(path, flags, context, /*immutableContent=*/false);
+}
+
+std::unique_ptr<common::FileInfo> HTTPFileSystem::openFileWithImmutability(const std::string& path,
+    FileOpenFlags flags, main::ClientContext* context, bool immutableContent) {
     if (context->getCurrentSetting(HTTPCacheFileConfig::HTTP_CACHE_FILE_OPTION).getValue<bool>()) {
         initCachedFileManager(context);
     }
     auto httpFileInfo = std::make_unique<HTTPFileInfo>(path, this, flags.flags, context);
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+    // Must be set before initialize(): the persistent-cache decision depends on
+    // whether the content is content-addressed (xet://).
+    httpFileInfo->immutableContent = immutableContent;
+#else
+    (void)immutableContent;
+#endif
     httpFileInfo->initialize(context);
     return httpFileInfo;
 }
@@ -363,61 +417,308 @@ void HTTPFileInfo::cacheBlock(uint64_t offset, uint64_t length,
     }
 }
 
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+void HTTPFileSystem::ensureBlockCache(main::ClientContext* context, bool wantPersistentCache) {
+    std::lock_guard<std::mutex> lck{initRemoteCachesMtx};
+    if ((blockCache && blockCache->enabled()) ||
+        (prefetchPool && !wantPersistentCache)) {
+        return;
+    }
+    const HTTPConfig config{context};
+#if !defined(__WASM__)
+    if (prefetchPool == nullptr && config.prefetchDepth > 0) {
+        // A modest pool suffices: depth scales the number of workers needed.
+        prefetchPool = std::make_unique<PrefetchPool>(std::min<size_t>(config.prefetchDepth,
+            /*cap*/ 8));
+    }
+#endif
+    if (!wantPersistentCache || blockCache != nullptr) {
+        return;
+    }
+    try {
+        const auto localDir = extension::ExtensionUtils::getLocalDirForExtension(context,
+            StringUtils::getLower(HttpfsExtension::EXTENSION_NAME));
+        auto cacheRoot = FileSystem::joinPath(localDir, ".block_cache");
+        if (blockCache == nullptr) {
+            blockCache = std::make_unique<PersistentBlockCache>();
+        }
+        blockCache->init(cacheRoot, config.cacheBlocksMaxMB * 1024ull * 1024ull);
+        if (!blockCache->enabled()) {
+            blockCache.reset();
+        }
+    } catch (Exception&) {
+        // Cache disabled on failure; reads still work over the network.
+        if (blockCache != nullptr) {
+            blockCache.reset();
+        }
+    }
+}
+
+HTTPFileSystem::PrefetchZone* HTTPFileSystem::zoneFor(const std::string& url) const {
+    std::lock_guard<std::mutex> lck{zoneMapMtx};
+    auto it = zones.find(url);
+    if (it == zones.end()) {
+        // Piecewise construction: PrefetchZone holds a mutex and must be
+        // constructed in place (non-movable).
+        it = zones.emplace(std::piecewise_construct, std::forward_as_tuple(url),
+            std::make_tuple())
+                 .first;
+    }
+    return &it->second;
+}
+#endif
+
+// Number of bytes served out of a span beginning at spanStart. A request may
+// be partially covered by the tail of a cached/prefetched span; the remainder
+// is fetched in subsequent loop iterations.
+inline uint64_t copySpanPortion(char* dest, const char* spanData, uint64_t spanStart,
+    uint64_t spanLen, uint64_t pos, uint64_t remaining) {
+    const auto spanOffset = pos - spanStart;
+    if (spanOffset >= spanLen) {
+        return 0;
+    }
+    const auto len = std::min<uint64_t>(spanLen - spanOffset, remaining);
+    std::memcpy(dest, spanData + spanOffset, len);
+    return len;
+}
+
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+void HTTPFileSystem::submitPrefetch(const HTTPFileInfo& fileInfo, uint64_t nextOffset,
+    uint64_t blockSize) const {
+    if (!prefetchPool || blockSize == 0 || fileInfo.httpConfig.prefetchDepth == 0) {
+        return;
+    }
+    auto* self = const_cast<HTTPFileSystem*>(this);
+    auto* zone = zoneFor(fileInfo.path);
+    for (uint64_t i = 0; i < fileInfo.httpConfig.prefetchDepth; ++i) {
+        const auto start = nextOffset + i * blockSize;
+        if (start >= fileInfo.length) {
+            break;
+        }
+        const auto len = std::min<uint64_t>(blockSize, fileInfo.length - start);
+        const std::string key = std::format("{}:{}", start, len);
+        {
+            std::lock_guard<std::mutex> lck{zone->mtx};
+            if (zone->inflight.contains(key) || zone->ready.contains(key)) {
+                continue;
+            }
+            zone->inflight.insert(key);
+        }
+        const std::string url = fileInfo.path;
+        struct InflightGuard {
+            PrefetchZone* zone;
+            const std::string& key;
+            bool released = false;
+            ~InflightGuard() {
+                if (!released) {
+                    std::lock_guard<std::mutex> lck{zone->mtx};
+                    zone->inflight.erase(key);
+                }
+            }
+        } inflightGuard{zone, key};
+
+        const bool submitted = prefetchPool->trySubmit(
+            [self, zone, url, start, len, key]() mutable {
+                try {
+                    std::vector<char> data(len);
+                    // XetFileSystem ignores the FileInfo* argument for range
+                    // fetches, so a null pointer is safe here. Virtual dispatch
+                    // ensures we land on the concrete implementation owning this
+                    // file's URL scheme.
+                    auto response = self->getRangeRequest(nullptr, url, {}, start,
+                        reinterpret_cast<char*>(data.data()), len);
+                    if (response != nullptr && response->code < 300 &&
+                        response->body.size() == len) {
+                        auto payload = std::make_shared<std::vector<char>>(std::move(data));
+                        {
+                            std::lock_guard<std::mutex> lck{zone->mtx};
+                            if (zone->ready.size() >= PrefetchZone::MAX_READY_ENTRIES) {
+                                // Bounded window: prefer evicting entries that were
+                                // already consumed at least once.
+                                bool evicted = false;
+                                for (auto it = zone->ready.begin(); it != zone->ready.end();
+                                     ++it) {
+                                    if (it->second.consumeCount > 0) {
+                                        zone->ready.erase(it);
+                                        evicted = true;
+                                        break;
+                                    }
+                                }
+                                if (!evicted) {
+                                    zone->inflight.erase(key);
+                                    return; // drop this speculative result entirely
+                                }
+                            }
+                            zone->ready[key] =
+                                ReadyEntry{std::move(payload), /*consumeCount=*/0};
+                        }
+                        if (const char* te = std::getenv("LBUG_HTTPFS_TRACE"); te && te[0] == '1') {
+                            std::fprintf(stderr, "[httpfs] PREFETCH DONE start=%llu len=%llu\n",
+                                (unsigned long long)start, (unsigned long long)len);
+                            std::fflush(stderr);
+                        }
+                    } else if (response != nullptr) {
+                        if (const char* te = std::getenv("LBUG_HTTPFS_TRACE"); te && te[0] == '1') {
+                            std::fprintf(stderr,
+                                "[httpfs] PREFETCH BADRESP code=%d size=%zu want=%llu\n",
+                                response->code, response->body.size(), (unsigned long long)len);
+                            std::fflush(stderr);
+                        }
+                    }
+                } catch (const common::Exception& e) {
+                    if (const char* te = std::getenv("LBUG_HTTPFS_TRACE"); te && te[0] == '1') {
+                        std::fprintf(stderr, "[httpfs] PREFETCH FAIL %s\n", e.what());
+                        std::fflush(stderr);
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lck{zone->mtx};
+                    zone->inflight.erase(key);
+                }
+            });
+        if (submitted) {
+            inflightGuard.released = true;
+        }
+    }
+}
+#endif
+
 void HTTPFileSystem::readFromFile(common::FileInfo& fileInfo, void* buffer, uint64_t numBytes,
     uint64_t position) const {
     auto& httpFileInfo = fileInfo.cast<HTTPFileInfo>();
     auto numBytesToRead = numBytes;
     auto bufferOffset = 0;
-    if (httpFileInfo.cachedFileInfo != nullptr) {
-        httpFileInfo.cachedFileInfo->readFromFile(buffer, numBytes, position);
-        httpFileInfo.fileOffset = position + numBytes;
-        return;
-    }
     httpFileInfo.fileOffset = position;
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+    PrefetchZone* zone = nullptr;
+    if (httpFileInfo.immutableContent && prefetchPool != nullptr) {
+        zone = zoneFor(httpFileInfo.path);
+    }
+    PersistentBlockCache* diskCache =
+        httpFileInfo.immutableContent ? blockCache.get() : nullptr;
+    if (!diskCache && httpFileInfo.httpConfig.cacheBlocks) {
+        // Opt-in persistent cache for non-content-addressed remote files.
+        // Currently only reachable for immutable datasets because cache init
+        // happens on open; kept here for future schemes.
+        diskCache = blockCache.get();
+    }
+#endif
     while (numBytesToRead > 0) {
         auto currentPos = position + bufferOffset;
 
-        // Try to serve from the LRU cache first.
-        if (auto* block = httpFileInfo.lookupCachedBlock(currentPos)) {
-            auto blockOffset = currentPos - block->offset;
-            auto buffer_read_len =
-                std::min<uint64_t>(block->length - blockOffset, numBytesToRead);
-            memcpy((char*)buffer + bufferOffset, block->data.get() + blockOffset,
-                buffer_read_len);
-            bufferOffset += buffer_read_len;
-            numBytesToRead -= buffer_read_len;
-            httpFileInfo.fileOffset += buffer_read_len;
-            continue;
+        // L1: serve from the in-memory LRU cache.
+        {
+            std::lock_guard<std::mutex> lck{httpFileInfo.readCacheMtx};
+            if (auto* block = httpFileInfo.lookupCachedBlock(currentPos)) {
+                const auto served = copySpanPortion((char*)buffer + bufferOffset,
+                    reinterpret_cast<const char*>(block->data.get()), block->offset, block->length,
+                    currentPos, numBytesToRead);
+                bufferOffset += served;
+                numBytesToRead -= served;
+                httpFileInfo.fileOffset += served;
+                if (served > 0) {
+                    continue;
+                }
+            }
         }
 
-        // Cache miss: choose a block size. Small reads are treated as
-        // metadata-like and use a smaller block size to avoid over-fetching.
-        uint64_t blockSize = (numBytesToRead <= httpFileInfo.httpConfig.metadataReadBufferSize)
-            ? httpFileInfo.httpConfig.metadataReadBufferSize
-            : httpFileInfo.httpConfig.readBufferSize;
-
-        // Bypass the cache for reads at least as large as the block size: the
-        // caller wants the data directly and caching it would just evict useful
-        // blocks.
-        if (numBytesToRead >= blockSize) {
-            getRangeRequest(&httpFileInfo, httpFileInfo.path, {}, currentPos,
-                (char*)buffer + bufferOffset, numBytesToRead);
-            httpFileInfo.fileOffset += numBytesToRead;
-            bufferOffset += numBytesToRead;
-            numBytesToRead = 0;
+        // Determine the span size used for all layers below (same rule as the
+        // original implementation so byte ranges stay identical).
+        const uint64_t blockSize =
+            (numBytesToRead <= httpFileInfo.httpConfig.metadataReadBufferSize)
+                ? httpFileInfo.httpConfig.metadataReadBufferSize
+                : httpFileInfo.httpConfig.readBufferSize;
+        const uint64_t fetchStart = (currentPos / blockSize) * blockSize;
+        if (fetchStart >= httpFileInfo.length) {
             break;
         }
-
-        // Fetch an aligned block into the cache.
-        auto fetchStart = (currentPos / blockSize) * blockSize;
-        auto fetchLen = std::min<uint64_t>(blockSize, httpFileInfo.length - fetchStart);
+        const uint64_t fetchLen =
+            std::min<uint64_t>(blockSize, httpFileInfo.length - fetchStart);
         if (fetchLen == 0) {
             break;
         }
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+        const bool haveRemoteOptimizations = zone != nullptr || diskCache != nullptr;
+
+        if (haveRemoteOptimizations) {
+            // L2: prefetched landing zone (parallel fetches already completed).
+            if (zone != nullptr) {
+                std::shared_ptr<std::vector<char>> payload;
+                {
+                    std::lock_guard<std::mutex> lck{zone->mtx};
+                    const std::string key = std::format("{}:{}", fetchStart, fetchLen);
+                    if (auto it = zone->ready.find(key); it != zone->ready.end()) {
+                        payload = it->second.payload;
+                        ++it->second.consumeCount;
+                    }
+                }
+                if (payload != nullptr && payload->size() == fetchLen) {
+                    auto blockData = std::make_unique<uint8_t[]>(fetchLen);
+                    std::memcpy(blockData.get(), payload->data(), fetchLen);
+                    {
+                        std::lock_guard<std::mutex> lck{httpFileInfo.readCacheMtx};
+                        httpFileInfo.cacheBlock(fetchStart, fetchLen, std::move(blockData));
+                    }
+                    if (const char* te = std::getenv("LBUG_HTTPFS_TRACE"); te && te[0] == '1') {
+                        std::fprintf(stderr, "[httpfs] ZONE HIT pos=%llu\n",
+                            (unsigned long long)currentPos);
+                        std::fflush(stderr);
+                    }
+                    continue; // loop serves from the LRU now
+                }
+            }
+
+            // L3: persistent cross-run cache (immutable spans only).
+            if (diskCache != nullptr && diskCache->enabled()) {
+                auto blockData = std::make_unique<uint8_t[]>(fetchLen);
+                if (diskCache->get(httpFileInfo.path, fetchStart, fetchLen,
+                        reinterpret_cast<char*>(blockData.get()))) {
+                    {
+                        std::lock_guard<std::mutex> lck{httpFileInfo.readCacheMtx};
+                        httpFileInfo.cacheBlock(fetchStart, fetchLen, std::move(blockData));
+                    }
+                    continue; // loop serves from the LRU now
+                }
+            }
+        }
+#endif // HTTPFS_REMOTE_READ_OPTIMIZATIONS
+
+        // L4: network fetch of the aligned span into a staging buffer.
         auto blockData = std::make_unique<uint8_t[]>(fetchLen);
+        if (const char* traceEnv = std::getenv("LBUG_HTTPFS_TRACE");
+            traceEnv != nullptr && traceEnv[0] == '1') {
+            std::fprintf(stderr,
+                "[httpfs] MISS pos=%llu nLeft=%llu bs=%llu zone=%d disk=%d imm=%d depth=%llu\n",
+                (unsigned long long)currentPos, (unsigned long long)numBytesToRead,
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+                (unsigned long long)blockSize, zone != nullptr, diskCache != nullptr,
+#else
+                (unsigned long long)blockSize, false, false,
+#endif
+                httpFileInfo.immutableContent,
+                (unsigned long long)httpFileInfo.httpConfig.prefetchDepth);
+            std::fflush(stderr);
+        }
         getRangeRequest(&httpFileInfo, httpFileInfo.path, {}, fetchStart,
-            (char*)blockData.get(), fetchLen);
-        httpFileInfo.cacheBlock(fetchStart, fetchLen, std::move(blockData));
+            reinterpret_cast<char*>(blockData.get()), fetchLen);
+
+#if HTTPFS_REMOTE_READ_OPTIMIZATIONS
+        if (haveRemoteOptimizations) {
+            // Write-through to the persistent cache and pipeline further reads.
+            if (diskCache != nullptr && diskCache->enabled()) {
+                diskCache->put(httpFileInfo.path, fetchStart, fetchLen,
+                    reinterpret_cast<const char*>(blockData.get()));
+            }
+            if (zone != nullptr) {
+                submitPrefetch(httpFileInfo, fetchStart + fetchLen, blockSize);
+            }
+        }
+#endif // HTTPFS_REMOTE_READ_OPTIMIZATIONS
+
+        {
+            std::lock_guard<std::mutex> lck{httpFileInfo.readCacheMtx};
+            httpFileInfo.cacheBlock(fetchStart, fetchLen, std::move(blockData));
+        }
         // Loop again: the next iteration will serve the request from the cache.
     }
 }
@@ -472,6 +773,70 @@ std::unique_ptr<httplib::Client> HTTPFileSystem::getClient(const std::string& ho
     client->set_connection_timeout(HTTPParams::DEFAULT_TIMEOUT);
     client->set_decompress(false);
     return client;
+}
+
+// Build a no-follow httplib client for `host` that does not automatically
+// follow redirects. The Xet resolve endpoint returns 302 Location headers which
+// the filesystem follows itself, so redirects must be surfaced rather than
+// absorbed (which would also point the pooled connection at the wrong host).
+static httplib::Client* makeNoRedirectClient(const std::string& host) {
+    auto client = std::make_unique<httplib::Client>(host);
+    client->set_follow_location(false);
+    client->set_url_encode(false);
+    client->set_keep_alive(HTTPParams::DEFAULT_KEEP_ALIVE);
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    client->enable_server_certificate_verification(false);
+#endif
+    client->set_write_timeout(HTTPParams::DEFAULT_TIMEOUT);
+    client->set_read_timeout(HTTPParams::DEFAULT_TIMEOUT);
+    client->set_connection_timeout(HTTPParams::DEFAULT_TIMEOUT);
+    client->set_decompress(false);
+    return client.release();
+}
+
+void HTTPFileSystem::lockHttp(const std::string& host) {
+    std::mutex* hostMutex = nullptr;
+    {
+        std::lock_guard<std::mutex> lck{hostLocksMtx};
+        auto it = hostLocks.find(host);
+        if (it == hostLocks.end()) {
+            it = hostLocks.emplace(host, std::make_shared<std::mutex>()).first;
+        }
+        hostMutex = it->second.get();
+    }
+    // Lock the host mutex outside of hostLocksMtx so other hosts stay free.
+    hostMutex->lock();
+}
+
+void HTTPFileSystem::unlockHttp(const std::string& host) {
+    std::shared_ptr<std::mutex> hostMutex;
+    {
+        std::lock_guard<std::mutex> lck{hostLocksMtx};
+        auto it = hostLocks.find(host);
+        if (it == hostLocks.end()) {
+            return;
+        }
+        hostMutex = it->second;
+    }
+    hostMutex->unlock();
+}
+
+httplib::Client* HTTPFileSystem::getSharedNoRedirectClient(const std::string& host) {
+    std::lock_guard<std::mutex> lck{httpPoolMtx};
+    auto it = sharedNoRedirectClients.find(host);
+    if (it == sharedNoRedirectClients.end()) {
+        std::unique_ptr<httplib::Client> client{makeNoRedirectClient(host)};
+        it = sharedNoRedirectClients.emplace(host, std::move(client)).first;
+    }
+    return it->second.get();
+}
+
+httplib::Client* HTTPFileSystem::evictAndGetSharedNoRedirectClient(const std::string& host) {
+    std::lock_guard<std::mutex> lck{httpPoolMtx};
+    sharedNoRedirectClients.erase(host);
+    std::unique_ptr<httplib::Client> client{makeNoRedirectClient(host)};
+    auto it = sharedNoRedirectClients.emplace(host, std::move(client)).first;
+    return it->second.get();
 }
 
 std::unique_ptr<httplib::Headers> HTTPFileSystem::getHTTPHeaders(HeaderMap& headerMap) {
@@ -572,6 +937,11 @@ std::unique_ptr<HTTPResponse> HTTPFileSystem::headRequest(FileInfo* fileInfo,
     return runBrowserRequestWithRetry("HEAD", url, std::move(headerMap));
 #else
     auto httpFileInfo = dynamic_cast_checked<HTTPFileInfo*>(fileInfo);
+    // Defensive: guard against any open path that did not go through
+    // initMetadata() (e.g. a future fast-path open) leaving the client null.
+    if (!httpFileInfo->httpClient) {
+        httpFileInfo->initializeClient();
+    }
     auto parsedURL = parseUrl(url);
     auto host = parsedURL.first;
     auto hostPath = parsedURL.second;
@@ -609,6 +979,11 @@ std::unique_ptr<HTTPResponse> HTTPFileSystem::getRangeRequest(FileInfo* fileInfo
     return response;
 #else
     auto httpFileInfo = dynamic_cast_checked<HTTPFileInfo*>(fileInfo);
+    // Defensive: guard against any open path that did not go through
+    // initMetadata() (e.g. a future fast-path open) leaving the client null.
+    if (!httpFileInfo->httpClient) {
+        httpFileInfo->initializeClient();
+    }
     auto parsedURL = parseUrl(url);
     auto host = parsedURL.first;
     auto hostPath = parsedURL.second;
@@ -689,6 +1064,9 @@ std::unique_ptr<HTTPResponse> HTTPFileSystem::postRequest(common::FileInfo* file
     return response;
 #else
     auto httpFileInfo = dynamic_cast_checked<HTTPFileInfo*>(fileInfo);
+    if (!httpFileInfo->httpClient) {
+        httpFileInfo->initializeClient();
+    }
     auto hostPath = parseUrl(url).second;
     auto headers = getHTTPHeaders(headerMap);
     uint64_t outputBufferPos = 0;
@@ -731,6 +1109,9 @@ std::unique_ptr<HTTPResponse> HTTPFileSystem::putRequest(common::FileInfo* fileI
         inputBufferLen);
 #else
     auto httpFileInfo = dynamic_cast_checked<HTTPFileInfo*>(fileInfo);
+    if (!httpFileInfo->httpClient) {
+        httpFileInfo->initializeClient();
+    }
     auto hostPath = parseUrl(url).second;
     auto headers = getHTTPHeaders(headerMap);
     std::function<httplib::Result(void)> request([&]() {
